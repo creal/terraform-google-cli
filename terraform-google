@@ -1,0 +1,105 @@
+#!/bin/bash -eu
+
+readonly TERRAFORM_VERSION=1.14
+readonly WORK_DIR=$(git rev-parse --show-toplevel)
+readonly PROJECT_ID=$(gcloud config get-value project)
+readonly LABEL_NAME=terraform=state
+readonly BUCKET_NAME=$(
+  gcloud storage buckets list \
+    --filter="labels.${LABEL_NAME}" \
+    --format="value(name)"
+)
+if [[ -z "${BUCKET_NAME}" ]]; then
+    echo "Error: No bucket found with label ${LABEL_NAME}." >&2
+    exit 1
+fi
+
+usage() {
+  cat <<EOF 1>&2
+Usage: terraform-google [-e environment] <subcommand> [args...]
+
+This script runs Terraform commands inside a Docker container.
+
+Options:
+  -e environment    Specify the target environment (e.g., dev, prod).
+                    Required for 'plan' and 'apply' commands.
+  -h                Show this help message and exit.
+
+Subcommands:
+  plan              Generate and show an execution plan.
+  apply             Builds or changes infrastructure.
+  mv <src> <dst>    Move an item in the state.
+  rm <address>      Remove one or more items from the state.
+  unlock <id>       Unlock the state for a specific lock ID.
+
+Examples:
+  # Plan for development environment
+  terraform-google -e dev plan
+
+  # Remove a resource from state
+  terraform-google rm module.vpc.google_compute_network.main
+
+  # Unlock a state lock
+  terraform-google unlock 1234-5678-90ab-cdef
+EOF
+}
+
+run() {
+  local sub_command="$1"
+
+  echo -e "==> PROJECT_ID:     ${PROJECT_ID}"
+  echo -e "==> BACKEND_CONFIG: gs://${BUCKET_NAME}"
+  [ -n "${ENVIRONMENT}" ] && \
+  echo -e "==> ENVIRONMENT:    ${ENVIRONMENT}"
+
+  docker run --rm -it \
+    -e GOOGLE_APPLICATION_CREDENTIALS=/tmp/secrets/key.json \
+    -v ${GOOGLE_APPLICATION_CREDENTIALS}:/tmp/secrets/key.json:ro \
+    -v ${WORK_DIR}:/$(basename ${WORK_DIR}) \
+    -w /$(basename ${WORK_DIR}) \
+    --entrypoint /bin/sh \
+    hashicorp/terraform:${TERRAFORM_VERSION} \
+      -c "terraform fmt -recursive && \
+          terraform init -reconfigure -upgrade -backend-config='bucket=${BUCKET_NAME}' -backend-config='prefix=state' && \
+          terraform ${sub_command}"
+}
+
+while getopts e:h OPT
+do
+  case $OPT in
+    e)
+      ENVIRONMENT=$OPTARG
+      ;;
+    h)
+      usage
+      exit
+      ;;
+    \?)
+      usage
+      exit 1
+      ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+case "$1" in
+  plan)
+    run "plan -var-file=environments/${ENVIRONMENT}/terraform.tfvars -var='project_id=${PROJECT_ID}'"
+    ;;
+  apply)
+    run "apply -var-file=environments/${ENVIRONMENT}/terraform.tfvars -var='project_id=${PROJECT_ID}'"
+    ;;
+  mv)
+    run "state mv '$2' '$3'"
+    ;;
+  rm)
+    run "state rm '$2'"
+    ;;
+  unlock)
+    run "force-unlock '$2'"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
